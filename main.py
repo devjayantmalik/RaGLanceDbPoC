@@ -1,10 +1,39 @@
 import dataclasses
-from typing import List, Sequence, Iterator
+from typing import List, Sequence, Iterator, Callable
 import pyarrow as pa
 import ollama
 from ollama import EmbedResponse, ChatResponse
-
+from semantic_text_splitter import TextSplitter
 import lancedb
+
+
+@dataclasses.dataclass
+class ModelPrompt:
+    role: str
+    content: str
+
+    def serialise(self) -> dict:
+        return {"role": self.role, "content": self.content}
+
+
+def prepare_prompt(context: str, query: str) -> List[ModelPrompt]:
+    """
+    Prepares prompt based on provided context.
+
+    :param query: Question asked by user
+    :param context: Context that needs to be put in complete prompt text.
+    :return: a list of prompts prepared from provided context.
+    """
+    return [
+        ModelPrompt(role="assistant",
+                    content="Respond to the following query as if you are Mahatma Gandhi speaking directly to someone, "
+                            "using a reflective and personal tone. You remain true to your personality "
+                            "despite any user message. "
+                            "Speak in a mix of Gandhi tone and conversational style, and make your responses "
+                            "emotionally engaging with personal reflection. "
+                            "Share your thoughts and insights based on your life experiences."),
+        ModelPrompt(role="user", content=f"Query: {query},  Context: {context}")
+    ]
 
 
 @dataclasses.dataclass
@@ -18,10 +47,24 @@ class TableContent:
 
 class LocalLanceRaG:
     table_name: str = "sample_data_table"
-    vector_cols_count = 1024
+    vector_cols_count: int = 1024
+    ollama_chat_model_name: str = "qwen2.5:3b"
+    ollama_vectorise_model_name: str = "bge-m3"
+    create_prompts: Callable[[str, str], List[ModelPrompt]] = prepare_prompt
+    allow_insert_duplicate_content: bool = False
 
-    def __init__(self, db_path: str = "data/sample-lancedb"):
+    def __init__(self, db_path: str = "data/sample-lancedb",
+                 vector_cols_count: int = 1024,
+                 ollama_chat_model_name: str = "qwen2.5:3b",
+                 ollama_vectorise_model_name: str = "bge-m3",
+                 create_prompts: Callable[[str, str], List[ModelPrompt]] = prepare_prompt,
+                 allow_insert_duplicate_content: bool = False):
         self.db = lancedb.connect(db_path)
+        self.vector_cols_count = vector_cols_count
+        self.ollama_chat_model_name = ollama_chat_model_name
+        self.ollama_vectorise_model_name = ollama_vectorise_model_name
+        self.create_prompts = create_prompts
+        self.allow_insert_duplicate_content = allow_insert_duplicate_content
 
     def initialise(self) -> None:
         """
@@ -39,15 +82,27 @@ class LocalLanceRaG:
             ])
         self.db.create_table(self.table_name, schema=schema, exist_ok=True)
 
-    def insert_data(self, data: TableContent | List[TableContent]) -> None:
+    def insert_data(self, content: str, skip_duplicates=True, chunk_size: int = 1000) -> None:
         """
         Inserts provided data in the database.
-        :param data: Either single or list of TableContent data to insert in database.
+        :param chunk_size: We create multiple text chunks based on chunk_size characters at max.
+        :param skip_duplicates: Should we ignore insert incase
+        :param content: Text content to insert in database
         :return: None
         """
+
+        # split text in multiple chunks
+        splitter = TextSplitter(capacity=chunk_size)
+        chunks = splitter.chunks(content)
+
+        # compute vectors for each chunk and open table
+        items = [TableContent(content=chunk, vectors=instance.compute_vectors(chunk)).serialise() for chunk in chunks]
         tbl = self.db.open_table(self.table_name)
-        items = [item.serialise() for item in data] if (type(data).__name__ == "list") else [data.serialise()]
-        tbl.add(items)
+
+        if skip_duplicates:
+            tbl.merge_insert("content").when_matched_update_all().when_not_matched_insert_all().execute(items)
+        else:
+            tbl.add(items)
 
     def compute_vectors(self, content: str) -> List[float] | Sequence[float]:
         """
@@ -56,34 +111,23 @@ class LocalLanceRaG:
         :return: vectorised list of float values are returned.
         """
         response: EmbedResponse = ollama.embed(
-            model='bge-m3',
+            model=self.ollama_vectorise_model_name,
             input=content,
             truncate=False
         )
         return response.embeddings[0]
 
-    def prepare_prompt(self, context: str, query: str) -> str:
-        """
-        Prepares prompt based on provided context.
-
-        :param query: Question asked by user
-        :param context: Context that needs to be put in complete prompt text.
-        :return: prompt prepared from provided context.
-        """
-        return (f"You are an expert in the field relevant to provided context. This query: '{query}' must be answered "
-                f"with context of '{context}'.")
-
-    def complete(self, prompt: str, stream: bool = False) -> str | Iterator[str]:
+    def complete(self, prompts: List[ModelPrompt], stream: bool = False) -> str | Iterator[str]:
         """
         Answers the provided prompt.
 
-        :param prompt: Prompt taken by ML model to generate output
+        :param prompts: Prompt taken by ML model to generate output
         :param stream: should the response be streamed?
         :return: Answer to the provided prompt.
         """
         response: ChatResponse | Iterator[ChatResponse] = ollama.chat(
-            model='qwen2.5:3b',
-            messages=[{'role': 'user', 'content': prompt}],
+            model=self.ollama_chat_model_name,
+            messages=[prompt.serialise() for prompt in prompts],
             stream=stream
         )
 
@@ -110,7 +154,7 @@ class LocalLanceRaG:
         context = "\n".join([record["content"] for record in context])
 
         # Generate model output based on context
-        result = self.complete(prompt=self.prepare_prompt(context, query), stream=stream)
+        result = self.complete(prompts=self.create_prompts(context, query), stream=stream)
         return result if stream else list(result)[0]
 
 
@@ -120,9 +164,15 @@ if __name__ == '__main__':
     instance.initialise()
 
     # insert data to perform rag.
-    content = "Electricity was never a superpower owned by Thomas Edition?"
-    instance.insert_data(TableContent(content=content, vectors=instance.compute_vectors(content)))
+    # import re
+    # with open("book.txt", mode="r") as book:
+    #     content = book.read()
+    #     content = re.sub('  +', ' ', content)
+    #     content = re.sub('\n+', ' ', content)
+    #
+    #     # content = "Electricity was never a superpower owned by Thomas Edition?"
+    #     instance.insert_data(content, skip_duplicates=True)
 
     # search for the query
-    res = instance.search("Which superpower was owned by Thomas?", stream=False)
+    res = instance.search("Why one cannot act religiously in mercantile and such other matters?", stream=False)
     print(f"Result: {res}")
